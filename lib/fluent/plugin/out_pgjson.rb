@@ -38,6 +38,8 @@ module Fluent::Plugin
 
     config_param :time_format, :string, default: "%F %T.%N %z"
 
+    config_param :reset_connection_interval, :integer, default: 5
+
     config_section :buffer do
       config_set_default :@type, DEFAULT_BUFFER_TYPE
       config_set_default :chunk_keys, ["tag"]
@@ -45,7 +47,11 @@ module Fluent::Plugin
 
     def initialize
       super
+      # if @conn == nil: The connection has not been established yet.
+      # if @conn != nil: The connection has been established, but it could be a broken connection.
       @conn = nil
+      @thread_lock = Mutex.new
+      @last_reset_ts = 0
     end
 
     def configure(conf)
@@ -62,11 +68,72 @@ module Fluent::Plugin
                  end
     end
 
-    def shutdown
-      if ! @conn.nil? and ! @conn.finished?
-        @conn.close()
+    def init_connection
+      # This function is used to init the connection (first connecting).
+      # If @conn == nil, try to establish a connection, and set @conn. 
+      # If @conn != nil, skip this function.
+      # @conn could be a nil or non-nil value after this call.
+      # This function must be protected by thread_lock to ensure thread safety.
+      if @conn.nil?
+        log.debug "[pgjson] [init_connection] Connecting to PostgreSQL server #{@host}:#{@port}, database #{@database}..."
+        begin
+          @thread_lock.lock()
+          @conn = PG::Connection.new(dbname: @database, host: @host, port: @port, sslmode: @sslmode, user: @user, password: @password)
+        rescue PG::Error
+          log.debug "[pgjson] [init_connection] Failed to initialize a connection."
+          if ! @conn.nil?
+            @conn.close()
+            @conn = nil
+          end
+        ensure
+          @thread_lock.unlock()
+        end
+      end
+    end
+
+    def timestamp
+       Time.now.getutc.to_i
+     end
+
+    def reset_connection
+      # This function try to fix the broken connection to database.
+      # if @conn == nil, call init_connection
+      # if @conn != nil, call @conn.reset
+      # This function must be protected by thread_lock to ensure thread safety.
+      begin
+        @thread_lock.lock()
+        if timestamp - @last_reset_ts > @reset_connection_interval
+          if @conn.nil?
+            log.debug "[pgjson] [reset_connection] Call init_connection."
+            init_connection
+          else
+            log.debug "[pgjson] [reset_connection] Reset Connection."
+            @conn.reset
+          end
+        else
+          log.debug "[pgjson] [reset_connection] Skip reset."
+        end
+      rescue => err
+        log.debug "[pgjson] [reset_connection] #{err.class}, #{err.message}"
+      ensure
+        @last_reset_ts = timestamp
+        @thread_lock.unlock()
       end
 
+    end
+
+    def shutdown
+      begin
+        @thread_lock.lock()
+        if ! @conn.nil?
+          @conn.close()
+          @conn = nil
+        end
+      rescue => err
+        log.debug "[pgjson] [shutdown] #{err.class}, #{err.message}"
+      ensure
+        @thread_lock.unlock()
+      end
       super
     end
 
@@ -85,41 +152,31 @@ module Fluent::Plugin
     def write(chunk)
       log.debug "[pgjson] in write, chunk id #{dump_unique_id_hex chunk.unique_id}"
       init_connection
-      @conn.exec("COPY #{@table} (#{@tag_col}, #{@time_col}, #{@record_col}) FROM STDIN WITH DELIMITER E'\\x01'")
-      begin
-        tag = chunk.metadata.tag
-        chunk.msgpack_each do |time, record|
-          @conn.put_copy_data "#{tag}\x01#{time}\x01#{record_value(record)}\n"
-        end
-      rescue => err
-        log.debug "[pgjson] error while writing, error is #{err.class}"
-        errmsg = "%s while copy data: %s" % [ err.class.name, err.message ]
-        @conn.put_copy_end( errmsg )
-        @conn.get_result
-        raise
-      else
-        @conn.put_copy_end
-        res = @conn.get_result
-        raise res.result_error_message if res.result_status!=PG::PGRES_COMMAND_OK
-      end
-    end
-
-    private
-
-    def init_connection
-      log.debug "[pgjson] in init_connection"
-      if @conn.nil?
-        log.debug "connecting to PostgreSQL server #{@host}:#{@port}, database #{@database}..."
+      if ! @conn.nil?
         begin
-          @conn = PG::Connection.new(dbname: @database, host: @host, port: @port, sslmode: @sslmode, user: @user, password: @password)
-        rescue
-          log.debug "[pgjson] init_connection connection failed."
-          if ! @conn.nil?
-            @conn.close()
-            @conn = nil
+          @conn.exec("COPY #{@table} (#{@tag_col}, #{@time_col}, #{@record_col}) FROM STDIN WITH DELIMITER E'\\x01'")
+          tag = chunk.metadata.tag
+          chunk.msgpack_each do |time, record|
+            @conn.put_copy_data "#{tag}\x01#{time}\x01#{record_value(record)}\n"
           end
-          raise "failed to initialize connection: #$!"
+        rescue PG::ConnectionBad, PG::UnableToSend => err
+          # connection error
+          reset_connection  # try to reset broken connection, and wait for next retry
+          errmsg = "%s while copy data: %s" % [ err.class.name, err.message ]
+          raise errmsg
+        rescue PG::Error => err
+          log.debug "[pgjson] [write] Error while writing, error is #{err.class}"
+          errmsg = "%s while copy data: %s" % [ err.class.name, err.message ]
+          @conn.put_copy_end( errmsg )
+          @conn.get_result
+          raise errmsg
+        else
+          @conn.put_copy_end
+          res = @conn.get_result
+          raise res.result_error_message if res.result_status != PG::PGRES_COMMAND_OK
         end
+      else
+        raise "Cannot connect to db host."
       end
     end
 
