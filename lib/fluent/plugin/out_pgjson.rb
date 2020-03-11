@@ -83,7 +83,7 @@ module Fluent::Plugin
     end
 
     def write(chunk)
-      log.debug "[pgjson] in write, chunk id #{chunk.unique_id}"
+      log.debug "[pgjson] in write, chunk id #{dump_unique_id_hex chunk.unique_id}"
       init_connection
       @conn.exec("COPY #{@table} (#{@tag_col}, #{@time_col}, #{@record_col}) FROM STDIN WITH DELIMITER E'\\x01'")
       begin
