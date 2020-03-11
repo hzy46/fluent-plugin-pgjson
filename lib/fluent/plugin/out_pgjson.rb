@@ -83,6 +83,7 @@ module Fluent::Plugin
     end
 
     def write(chunk)
+      log.debug "[pgjson] in write, chunk id #{chunk.unique_id}"
       init_connection
       @conn.exec("COPY #{@table} (#{@tag_col}, #{@time_col}, #{@record_col}) FROM STDIN WITH DELIMITER E'\\x01'")
       begin
@@ -91,6 +92,7 @@ module Fluent::Plugin
           @conn.put_copy_data "#{tag}\x01#{time}\x01#{record_value(record)}\n"
         end
       rescue => err
+        log.debug "[pgjson] error while writing, error is #{err.class}"
         errmsg = "%s while copy data: %s" % [ err.class.name, err.message ]
         @conn.put_copy_end( errmsg )
         @conn.get_result
@@ -105,12 +107,13 @@ module Fluent::Plugin
     private
 
     def init_connection
+      log.debug "[pgjson] in init_connection"
       if @conn.nil?
         log.debug "connecting to PostgreSQL server #{@host}:#{@port}, database #{@database}..."
-
         begin
           @conn = PG::Connection.new(dbname: @database, host: @host, port: @port, sslmode: @sslmode, user: @user, password: @password)
         rescue
+          log.debug "[pgjson] init_connection connection failed."
           if ! @conn.nil?
             @conn.close()
             @conn = nil
